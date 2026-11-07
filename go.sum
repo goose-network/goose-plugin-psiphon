@@ -108,6 +108,10 @@ github.com/google/pprof v0.0.0-20211214055906-6f57359322fd h1:1FjCyPC+syAzJ5/2S8
 github.com/google/pprof v0.0.0-20211214055906-6f57359322fd/go.mod h1:KgnwoLYCZ8IQu3XUZ8Nc/bM9CCZFOyjUNOSygVozoDg=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/goose-network/goose-plugin-api v0.0.1 h1:9WpZ5ShKe7gcDo5P72+8ae/r6mgJp+Pl4SNTbErEPm8=
+github.com/goose-network/goose-plugin-api v0.0.1/go.mod h1:EYQF1WhEU/JhxP3SkSSjAWLBlnazvrj0Ex1EL4G3oHY=
+github.com/goose-network/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091 h1:/kl1bUv9L6QDZFHEFvXE5g8+pgI5v5LdWWWiFbhDCYw=
+github.com/goose-network/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091/go.mod h1:KS+6ifNiSmFA5ghD7i4XrrCZCWm27ZCuKrzPpbDpGjw=
 github.com/grafov/m3u8 v0.0.0-20171211212457-6ab8f28ed427 h1:xh96CCAZTX8LJPFoOVRgTwZbn2DvJl8fyCyivohhSIg=
 github.com/grafov/m3u8 v0.0.0-20171211212457-6ab8f28ed427/go.mod h1:PdjzaU/pJUo4jTIn2rcgMFs+HqBGl/sPJLr8BI0Xq/I=
 github.com/hashicorp/golang-lru v1.0.2 h1:dV3g9Z/unq5DpblPpw+Oqcv4dU/1omnb4Ok8iPY6p1c=

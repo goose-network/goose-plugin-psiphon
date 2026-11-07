@@ -123,11 +123,12 @@ The `go1.26.8` toolchain pin is required because `psiphon-tunnel-core`'s
 `psiphon-tls` is ABI-incompatible with Go 1.27 (`tls.ConnectionState` field
 count mismatch).
 
-`go.mod` uses local `replace` directives to sibling repos:
+`go.mod` requires the plugin API at its published tag and redirects
+`psiphon-tunnel-core` at the goose-network fork, which carries the
+`SetCustomDialer`/`HasActiveTunnel` APIs the plugin uses:
 
 ```
-replace github.com/goose-network/goose-plugin-api    => ../goose-plugin-api
-replace github.com/Psiphon-Labs/psiphon-tunnel-core  => ../psiphon-tunnel-core
+replace github.com/Psiphon-Labs/psiphon-tunnel-core => github.com/goose-network/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091
 ```
 
 ## Run with Goose

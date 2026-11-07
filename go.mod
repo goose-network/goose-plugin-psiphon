@@ -13,8 +13,8 @@ go 1.26.0
 toolchain go1.26.8
 
 require (
-	github.com/Psiphon-Labs/psiphon-tunnel-core v0.0.0
-	github.com/goose-network/goose-plugin-api v0.0.0-20261026144344-7d923b10a2d5
+	github.com/Psiphon-Labs/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091
+	github.com/goose-network/goose-plugin-api v0.0.1
 )
 
 require (
@@ -117,9 +117,9 @@ require (
 	tailscale.com v1.58.2 // indirect
 )
 
-// Local checkouts: the api module and tunnel-core live as sibling repos under
-// /home/ubuntu/Downloads/proxy. These replaces make the plugin build against
-// the local sources rather than a (nonexistent) published version.
-replace github.com/goose-network/goose-plugin-api => ../goose-plugin-api
-
-replace github.com/Psiphon-Labs/psiphon-tunnel-core => ../psiphon-tunnel-core
+// The plugin consumes tunnel-core APIs that exist only on the goose-network
+// fork (Config.SetCustomDialer, Controller.HasActiveTunnel), so the
+// dependency is redirected at the fork; the pinned commit is fork-only.
+// Everything else — the plugin API included — resolves from the module
+// proxy at its published version.
+replace github.com/Psiphon-Labs/psiphon-tunnel-core => github.com/goose-network/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091
