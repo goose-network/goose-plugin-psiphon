@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -542,5 +543,35 @@ func TestOutboundsOmitsGenericTunnel(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Errorf("outbounds with an empty datastore = %v, want none", out)
+	}
+}
+
+// TestServerTunnelStateRefusesAfterClose pins the Close ordering: a dial that
+// already passed lookupLiveProvider must not be handed pinned state, because
+// Close has drained p.pinned and nothing would ever stop what it starts. The
+// closed check must also precede the servers lookup, so no fresh state is
+// created from the last scan after Close.
+func TestServerTunnelStateRefusesAfterClose(t *testing.T) {
+	p := &Provider{
+		closed:  true,
+		servers: map[string]serverInfo{"1.2.3.4": {IP: "1.2.3.4"}},
+		pinned:  map[string]*serverTunnel{},
+	}
+	if _, err := p.serverTunnelState("1.2.3.4"); err == nil {
+		t.Error("serverTunnelState handed out state on a closed provider")
+	}
+}
+
+// TestTunnelForServerRefusesDeadState covers the reaper's window: state that
+// was stopped and dropped from p.pinned while a dial still held a reference
+// must not sprout a controller nobody would ever reap or close again. The
+// dialer's retry gets fresh state from serverTunnelState instead.
+func TestTunnelForServerRefusesDeadState(t *testing.T) {
+	p := &Provider{cfg: providerConfig{OutboundID: "psiphon"}}
+	st := &serverTunnel{ip: "1.2.3.4"}
+	st.stop()
+	_, err := p.tunnelForServer(st)
+	if err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Errorf("tunnelForServer on retired state = %v, want the retired-state error", err)
 	}
 }

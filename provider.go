@@ -117,6 +117,7 @@ type Provider struct {
 	main *tunnelCore
 
 	mu      sync.Mutex
+	closed  bool                     // Close ran; serverTunnelState hands out no new state
 	servers map[string]serverInfo    // last scan, by IP: the pin sources
 	pinned  map[string]*serverTunnel // live per-server controllers, by IP
 
@@ -143,8 +144,9 @@ type providerConfig struct {
 
 // NewProvider is the ProviderFactory registered as "psiphon". It loads the
 // config, opens the datastore, starts the general tunnel, and subscribes to
-// tunnel-core notices; Outbounds emits the general outbound once the tunnel
-// is up and the per-server outbounds as soon as the datastore has entries.
+// tunnel-core notices; Outbounds emits one outbound per server as soon as the
+// datastore has entries. The general tunnel itself is deliberately not an
+// outbound: no single address describes where its traffic exits.
 func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	// The notice hub is a process global; installing it here means notices
 	// are routed to providers the moment the first one exists.
@@ -273,10 +275,10 @@ func (p *Provider) establishTimeout() time.Duration {
 }
 
 // handleNotice reacts to tunnel-core notices: tunnel establishment and
-// remote-server-list downloads both signal the engine to re-poll, so the
-// general outbound appears the moment the tunnel is up and the per-server
-// outbounds seconds after each list download. The list download also
-// timestamps itself for Status.
+// remote-server-list downloads both signal the engine to re-poll —
+// establishment means the fetcher is running, a list download seeds the
+// datastore — so the per-server outbounds appear seconds after each download.
+// The list download also timestamps itself for Status.
 func (p *Provider) handleNotice(n notice) {
 	switch n.Type {
 	case "Tunnels":
@@ -411,6 +413,12 @@ func (p *Provider) Close() error {
 			p.unsub()
 		}
 		unregisterLiveProvider(p)
+		// Closed before anything tears down: a dial already past
+		// lookupLiveProvider must not be handed fresh pinned state, or it
+		// starts a controller that escapes the drain below.
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
 		p.cancel()
 		if p.main != nil {
 			p.main.stop()
@@ -476,6 +484,9 @@ func (p *Provider) dialServer(ctx context.Context, ip, target string) (net.Conn,
 func (p *Provider) serverTunnelState(ip string) (*serverTunnel, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, fmt.Errorf("psiphon: provider closed")
+	}
 	if st, ok := p.pinned[ip]; ok {
 		return st, nil
 	}
@@ -489,11 +500,19 @@ func (p *Provider) serverTunnelState(ip string) (*serverTunnel, error) {
 }
 
 // tunnelForServer returns a live pinned tunnel for st, starting one when
-// none is running and no recent start failure is being held. Callers hold
-// st's open-connection pin, so the reaper stays off for the duration.
+// none is running and no recent start failure is being held. Retired state —
+// stopped by Close or the reaper — is refused rather than resurrected.
+// Callers hold st's open-connection pin, so the reaper stays off for the
+// duration.
 func (p *Provider) tunnelForServer(st *serverTunnel) (*tunnelCore, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.dead {
+		// The owner already dropped st from p.pinned; a controller started
+		// here would be orphaned. The dialer's retry gets fresh state from
+		// serverTunnelState.
+		return nil, fmt.Errorf("psiphon: server %s tunnel state retired; retry", st.ip)
+	}
 	if st.tunnel != nil && !st.tunnel.stopped() {
 		return st.tunnel, nil
 	}
@@ -535,7 +554,16 @@ func (p *Provider) reapOnce() {
 	p.mu.Lock()
 	var reap []*serverTunnel
 	for ip, st := range p.pinned {
-		if st.open.Load() != 0 || st.tunnel == nil {
+		if st.open.Load() != 0 {
+			continue
+		}
+		// st.tunnel is guarded by st.mu, not p.mu: a concurrent dial may be
+		// mid-start. Take it briefly to read; the p.mu → st.mu order matches
+		// every other path (none takes st.mu then p.mu).
+		st.mu.Lock()
+		running := st.tunnel != nil
+		st.mu.Unlock()
+		if !running {
 			continue
 		}
 		if st.idleFor() < serverIdleReap {

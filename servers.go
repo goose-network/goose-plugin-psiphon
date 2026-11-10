@@ -88,6 +88,7 @@ type serverTunnel struct {
 	tunnel   *tunnelCore
 	startErr error
 	startAt  time.Time
+	dead     bool // stop() ran; the state is retired and starts no new controller
 
 	open     atomic.Int32
 	lastUsed atomic.Int64 // unix nano; set on start attempt and each dial
@@ -106,12 +107,15 @@ func (st *serverTunnel) idleFor() time.Duration {
 	return time.Since(time.Unix(0, last))
 }
 
-// stop tears the pinned tunnel down and clears it, so the next dial starts a
-// fresh controller. It is idempotent.
+// stop tears the pinned tunnel down and retires the state: its owner (Close,
+// the reaper) drops it from p.pinned, so the next dial gets a fresh state
+// from serverTunnelState instead of resurrecting a controller here. It is
+// idempotent.
 func (st *serverTunnel) stop() {
 	st.mu.Lock()
 	t := st.tunnel
 	st.tunnel = nil
+	st.dead = true
 	st.mu.Unlock()
 	if t != nil {
 		t.stop()
