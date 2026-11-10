@@ -2,17 +2,19 @@
 // memory.
 //
 // The provider (provider.go) emits outbound configs with protocol "psiphon":
-// one general outbound (tunnel-core picks any server) plus one per server in
-// the datastore's list. The factory registered here turns those configs into
-// Outbounds whose DialContext resolves the live provider through the
-// liveProviders registry and calls straight into its controller — no local
-// SOCKS or HTTP proxy sits between the engine and the tunnel.
+// one per server in the datastore's list. The factory registered here also
+// serves hand-written engine-config outbounds — including the general shape
+// (no "server"), which dials through the provider's main tunnel with
+// tunnel-core picking any server. It turns those configs into Outbounds
+// whose DialContext resolves the live provider through the liveProviders
+// registry and calls straight into its controller — no local SOCKS or HTTP
+// proxy sits between the engine and the tunnel.
 //
 // Resolution happens at DIAL time, not build time: the engine rebuilds
 // outbounds on every config bump, and a provider restart (spec edited) or a
 // late provider start would otherwise leave built outbounds holding a dead
-// provider pointer. The registry is keyed by the provider's general outbound
-// ID ("psiphon" by default), which the engine enforces unique as an outbound
+// provider pointer. The registry is keyed by the provider's tunnel ID
+// ("psiphon" by default), which the engine enforces unique as an outbound
 // ID, so per-server configs carry their owning provider's ID under
 // "tunnel" and always find the live instance.
 package psiphon
@@ -26,10 +28,10 @@ import (
 	pub "github.com/goose-network/goose-plugin-api"
 )
 
-// liveProviders maps the general outbound ID to the live provider instance.
+// liveProviders maps the provider's tunnel ID to the live provider instance.
 var liveProviders sync.Map // string → *Provider
 
-// registerLiveProvider publishes p under its general outbound ID. A provider
+// registerLiveProvider publishes p under its tunnel ID. A provider
 // being restarted under the same ID replaces the previous entry; the previous
 // provider's Close removes the entry only when it still owns it.
 func registerLiveProvider(p *Provider) {
@@ -56,8 +58,8 @@ func lookupLiveProvider(tunnelID string) (*Provider, bool) {
 // tunnel's net.Conn directly, in process.
 type Outbound struct {
 	id      string
-	address string // server ip:webPort, or "" for the general outbound
-	tunnel  string // owning provider's general outbound ID (registry key)
+	address string // server ip:webPort, or "" for the general shape
+	tunnel  string // owning provider's tunnel ID (registry key)
 	server  string // pinned server IP; "" dials through the general tunnel
 	region  string // informational
 }

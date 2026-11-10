@@ -6,13 +6,20 @@ A [Goose](../goose) outbound **provider** plugin backed by
 It embeds `psiphon-tunnel-core` as a Go library, runs its controllers
 directly — with **no local SOCKS/HTTP proxy** in between — and exposes:
 
-- one **general** outbound (`psiphon`, any server — tunnel-core picks), and
 - one outbound **per real Psiphon server** from the auto-downloaded signed
   server list (IP, region, protocols), each pinned to its own server.
 
-Goose merges all of them into a managed pool, so any inbound routed through
-the pool forwards traffic through Psiphon, and the web UI shows the actual
-server list.
+The plugin's **general** tunnel keeps running in the background — it hosts
+the server-list fetcher and the datastore, and a hand-written `psiphon`
+outbound in the engine config still dials through it — but it is no longer
+exposed as an outbound of its own: tunnel-core picks which server a general
+dial exits from per connection, so Goose could never attribute an exit IP,
+region, or latency sample to it, while every server it could pick already
+has its own record.
+
+Goose merges the per-server outbounds into a managed pool, so any inbound
+routed through the pool forwards traffic through Psiphon, and the web UI
+shows the actual server list.
 
 ## In-memory dials, engine-stack transport
 
@@ -104,7 +111,7 @@ Goose's config:
 | `data_dir` | no | `psiphon-data` (working dir) | Data root for tunnel-core's datastore + diagnostics, anchored next to the engine's own state so the server list survives restarts. |
 | `upstream_proxy` | no | — | Raw upstream proxy URL tunnel-core uses (e.g. `socks5://127.0.0.1:7890`). Required on networks that block direct 443. When the engine injects its route/stack dialer, the URL serves the untunneled list/upgrade fetches only (tunnel dials ride the engine dialer); otherwise it carries tunnel dials too. Prefer the spec-level `upstream_proxy` (a goose route) for the dials themselves. |
 | `establish_timeout_seconds` | no | `120` | How long a dial waits for its tunnel to establish. |
-| `outbound_id` | no | `"psiphon"` | ID of the general outbound; per-server IDs are `<outbound_id>-<ip>`. Must be unique across providers — outbound configs use it to find the live provider at dial time. |
+| `outbound_id` | no | `"psiphon"` | ID of the provider's general tunnel; per-server outbound IDs are `<outbound_id>-<ip>`. Must be unique across providers — outbound configs use it to find the live provider at dial time. |
 
 `sanitizeConfig` strips host-specific and runtime-owned fields from the
 Psiphon config (Windows `Migrate*` paths whose backslashes break the

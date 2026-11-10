@@ -16,8 +16,13 @@
 // server list (verified against the production RSA keys embedded in
 // defaults.go), auto-updating it exactly like the official Psiphon client.
 // The provider scans the datastore and emits one goose outbound per pinnable
-// server — IP, region, protocols — plus one general outbound that lets
-// tunnel-core pick any server. The engine shows every one of them through
+// server — IP, region, protocols. It deliberately emits no general outbound:
+// which server a general-tunnel dial exits from is tunnel-core's
+// per-connection choice, so the engine could never attribute an exit IP, a
+// region or a latency sample to it, while every server it could pick already
+// has its own record. The main tunnel still runs — it hosts the fetcher and
+// the datastore, and a hand-written psiphon outbound in the engine config
+// still dials through it. The engine shows every per-server outbound through
 // its admin API, so the web UI displays Psiphon's actual servers, and each
 // can be pooled, pinned, or filtered like any other outbound.
 //
@@ -290,10 +295,17 @@ func (p *Provider) Name() string { return "psiphon" }
 // Watch returns the change signal channel.
 func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 
-// Outbounds returns the provider's outbound set: the general outbound (once
-// the main tunnel is established) plus one outbound per pinnable server in
-// the datastore. Per-server outbounds do not wait for the main tunnel — each
-// dials through its own lazily-started pinned controller.
+// Outbounds returns the provider's outbound set: one outbound per pinnable
+// server in the datastore. Per-server outbounds do not wait for the main
+// tunnel — each dials through its own lazily-started pinned controller.
+//
+// The provider deliberately emits no generic outbound riding the main
+// tunnel: tunnel-core picks which server such a dial exits from at
+// connection time, so the engine could never attribute an exit IP, a region
+// or a latency sample to a server it cannot see, while every server the main
+// tunnel could pick already has its own record below. A hand-written psiphon
+// outbound in the engine config (tunnel: "psiphon") still dials through the
+// main tunnel unchanged.
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	// Tunnel dials ride a connected TCP tunnel when a raw upstream proxy URL
 	// or an injected engine route is configured, so list only the protocols
@@ -314,17 +326,7 @@ func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
 	p.servers = srv
 	p.mu.Unlock()
 
-	out := make([]pub.OutboundConfig, 0, len(servers)+1)
-	if p.main.established.Load() {
-		out = append(out, pub.OutboundConfig{
-			ID:       p.cfg.OutboundID,
-			Protocol: "psiphon",
-			Config: map[string]any{
-				"id":     p.cfg.OutboundID,
-				"tunnel": p.cfg.OutboundID,
-			},
-		})
-	}
+	out := make([]pub.OutboundConfig, 0, len(servers))
 	for _, s := range servers {
 		out = append(out, pub.OutboundConfig{
 			ID:       p.cfg.OutboundID + "-" + s.IP,

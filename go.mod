@@ -4,8 +4,10 @@
 // It embeds Psiphon's tunnel-core as a Go library, runs its controllers
 // directly — dials go in memory through controller.Dial, with the tunnels'
 // own connections routed through the engine's network stack — and emits one
-// general outbound plus one outbound per server in the auto-updated signed
-// remote server list. See provider.go.
+// outbound per server in the auto-updated signed remote server list. The
+// general tunnel keeps running (server-list fetcher, datastore, hand-written
+// general outbounds) but is not emitted as an outbound of its own, since its
+// exit server is tunnel-core's per-connection choice. See provider.go.
 module github.com/goose-network/goose-plugin-psiphon
 
 go 1.26.0

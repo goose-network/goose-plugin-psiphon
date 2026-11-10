@@ -3,6 +3,8 @@ package psiphon
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -498,5 +500,47 @@ func TestStatusReport(t *testing.T) {
 	st = p.Status()
 	if st.Details["last_list_download"] == "never" {
 		t.Error("last_list_download still \"never\" after a download notice")
+	}
+}
+
+// TestOutboundsOmitsGenericTunnel verifies the provider emits no generic
+// main-tunnel outbound, even once the main tunnel is established: which
+// server such a dial exits from is tunnel-core's per-connection choice, so
+// the engine could never attribute an exit IP, region or latency sample to a
+// server it cannot see. Every pinnable server keeps its own record.
+func TestOutboundsOmitsGenericTunnel(t *testing.T) {
+	root := t.TempDir()
+	// OpenDataStore needs its directory tree to exist; the bolt file itself
+	// it creates.
+	storeDir := filepath.Join(root, "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := psiphon.OpenDataStore(&psiphon.Config{DataRootDirectory: root}); err != nil {
+		t.Fatalf("OpenDataStore: %v", err)
+	}
+	defer psiphon.CloseDataStore()
+
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "psiphon"},
+		dataDir: root,
+		servers: map[string]serverInfo{},
+		pinned:  map[string]*serverTunnel{},
+		watchCh: make(chan struct{}, 1),
+		main:    &tunnelCore{},
+	}
+	p.main.established.Store(true) // the old gate for the generic emission
+
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	for _, o := range out {
+		if o.ID == "psiphon" {
+			t.Errorf("generic tunnel outbound %q emitted with config %v", o.ID, o.Config)
+		}
+	}
+	if len(out) != 0 {
+		t.Errorf("outbounds with an empty datastore = %v, want none", out)
 	}
 }
