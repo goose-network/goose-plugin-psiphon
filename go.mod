@@ -120,8 +120,8 @@ require (
 )
 
 // The plugin consumes tunnel-core APIs that exist only on the goose-network
-// fork (Config.SetCustomDialer, Controller.HasActiveTunnel), so the
-// dependency is redirected at the fork; the pinned commit is fork-only.
-// Everything else — the plugin API included — resolves from the module
-// proxy at its published version.
-replace github.com/Psiphon-Labs/psiphon-tunnel-core => github.com/goose-network/psiphon-tunnel-core v0.0.0-20261026140314-5d979dcb6091
+// fork (Config.SetCustomDialer, Config.SetFetchDialer,
+// Controller.HasActiveTunnel), so the dependency is redirected at the fork;
+// the pinned commit is fork-only. Everything else — the plugin API included —
+// resolves from the module proxy at its published version.
+replace github.com/Psiphon-Labs/psiphon-tunnel-core => github.com/goose-network/psiphon-tunnel-core v0.0.0-20261125071410-5d270b877c2c

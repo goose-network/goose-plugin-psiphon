@@ -23,19 +23,21 @@
 // The engine injects its layer-3/4 stack dialer (pub.StackDialerKey) into
 // every provider config and, when the provider spec's upstream_proxy names
 // an engine route (outbound:/pool:/chain:), the route dialer too
-// (pub.UpstreamDialerKey). newTunnelCore hands tunnel-core whichever it has
-// via Config.SetCustomDialer, so the tunnel's own TCP connections to its
-// Psiphon servers dial through the engine — the route's outbound/pool/chain
-// when named (its outermost hop rides the engine stack), else the engine's
-// network stack (system kernel or gvisor) — instead of bare sockets.
+// (pub.UpstreamDialerKey). The two govern different dial surfaces:
 //
-// Precedence: route over stack, and either over tunnel-core's own dialer.
-// The raw upstream_proxy URL in the config JSON is untouched: a custom
-// dialer replaces tunnel-core's base dialer entirely, so the URL no longer
-// reaches tunnel dials (which the custom dialer owns), but it still serves
-// the untunneled dials no custom dialer can reach — the remote server list
-// and upgrade downloads — exactly as before. The route thus composes with,
-// rather than silently discards, a configured raw proxy.
+//   - tunnel dials (the tunnels' own TCP connections to their Psiphon
+//     servers) ride the engine stack via Config.SetCustomDialer, or dial
+//     directly when no stack was injected. They never ride the provider
+//     upstream — neither the injected route nor the raw upstream_proxy URL.
+//   - server-list fetches (the untunneled remote server list and upgrade
+//     downloads) ride the provider upstream via Config.SetFetchDialer: the
+//     injected engine route when present, else the raw upstream_proxy URL,
+//     else direct.
+//
+// The raw upstream_proxy URL is kept out of tunnel-core's config entirely
+// (sanitizeConfig strips UpstreamProxyURL): were it left in, it would route
+// tunnel dials too — including the meek/fronted protocols SetCustomDialer
+// does not cover. The fetch dialer carries it for fetches only.
 package psiphon
 
 import (
@@ -90,19 +92,53 @@ func upstreamDialerFunc(d pub.UpstreamDialer) common.Dialer {
 	}
 }
 
-// engineCustomDialer picks the dialer tunnel-core's CustomDialer gets: the
-// injected engine route when the provider spec's upstream_proxy names a
-// goose route (outbound:/pool:/chain:), else the engine's layer-3/4 stack —
-// nil when the plugin embeds neither and tunnel-core dials with its own
-// kernel dialer.
-func engineCustomDialer(stackDialer pub.StackDialer, upstream pub.UpstreamDialer) common.Dialer {
-	if upstream != nil {
-		return upstreamDialerFunc(upstream)
-	}
+// tunnelCustomDialer picks the dialer tunnel-core's CustomDialer gets for the
+// tunnels' own connections to their Psiphon servers: the engine's layer-3/4
+// stack, or nil when none was injected and tunnel-core dials directly. The
+// provider upstream (route or raw URL) never reaches tunnel dials — it is
+// fetch-only (see fetchDialer).
+func tunnelCustomDialer(stackDialer pub.StackDialer) common.Dialer {
 	if stackDialer != nil {
 		return stackDialerFunc(stackDialer)
 	}
 	return nil
+}
+
+// fetchDialer picks the dialer tunnel-core's FetchDialer gets for untunneled
+// server-list/upgrade fetches: the injected engine route when the provider
+// spec's upstream_proxy names a goose route (outbound:/pool:/chain:), else the
+// raw upstream_proxy URL, else nil (tunnel-core fetches directly).
+func fetchDialer(upstream pub.UpstreamDialer, upstreamProxyURL string) common.Dialer {
+	if upstream != nil {
+		return upstreamDialerFunc(upstream)
+	}
+	if upstreamProxyURL != "" {
+		return rawProxyFetchDialer(upstreamProxyURL)
+	}
+	return nil
+}
+
+// rawProxyFetchDialer adapts a raw upstream proxy URL to tunnel-core's
+// common.Dialer for fetches. It reuses tunnel-core's own proxied TCP dial
+// (ctx-aware, the proxy handshake interruptible on cancellation); the
+// connection to the proxy itself dials directly, as tunnel-core's
+// UpstreamProxyURL path always has.
+func rawProxyFetchDialer(upstreamProxyURL string) common.Dialer {
+	resolveIP := func(ctx context.Context, hostname string) ([]net.IP, error) {
+		if ip := net.ParseIP(hostname); ip != nil {
+			return []net.IP{ip}, nil
+		}
+		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" {
+			return nil, fmt.Errorf("psiphon: %s unsupported for fetch dial", network)
+		}
+		return psiphon.DialTCP(ctx, address, &psiphon.DialConfig{
+			UpstreamProxyURL: upstreamProxyURL,
+			ResolveIP:        resolveIP,
+		})
+	}
 }
 
 // tunnelOptions parametrizes newTunnelCore: the two shapes share everything
@@ -119,6 +155,10 @@ type tunnelOptions struct {
 	// establishTimeout bounds waitEstablished and the controller's own
 	// establishment budget.
 	establishTimeout time.Duration
+	// upstreamProxyURL is the raw provider upstream_proxy URL, carried by the
+	// fetch dialer only — never tunnel-core's config, so tunnel dials stay off
+	// it. Empty when no raw URL is configured.
+	upstreamProxyURL string
 }
 
 // newTunnelCore loads configJSON, applies the plugin's runtime parameters and
@@ -126,10 +166,11 @@ type tunnelOptions struct {
 // start after any datastore setup (the general tunnel's datastore must be
 // open before the controller runs; pinned tunnels share the open one).
 //
-// stackDialer and upstream may each be nil (dial directly): upstream is the
-// engine-injected route dialer and outranks stackDialer (see the file
-// comment). The config JSON must already be sanitized (host-specific fields
-// stripped, upstream proxy injected).
+// stackDialer and upstream may each be nil. stackDialer carries tunnel dials
+// (direct when nil); upstream carries server-list fetches, falling back to
+// opts.upstreamProxyURL then direct (see the file comment). The config JSON
+// must already be sanitized (host-specific fields stripped, UpstreamProxyURL
+// removed so tunnel dials never ride it).
 func newTunnelCore(configJSON []byte, opts tunnelOptions, stackDialer pub.StackDialer, upstream pub.UpstreamDialer) (*tunnelCore, error) {
 	config, err := psiphon.LoadConfig(configJSON)
 	if err != nil {
@@ -169,10 +210,15 @@ func newTunnelCore(configJSON []byte, opts tunnelOptions, stackDialer pub.StackD
 		config.DisableServerEntriesReporter = &noReport
 	}
 
-	// Route the tunnel's own TCP connections to its Psiphon server through
-	// the engine (see the file comment for the upstream_proxy interaction).
-	if d := engineCustomDialer(stackDialer, upstream); d != nil {
+	// Tunnel dials ride the engine stack, or dial directly when none was
+	// injected; they never ride the provider upstream (see the file comment).
+	if d := tunnelCustomDialer(stackDialer); d != nil {
 		config.SetCustomDialer(d)
+	}
+	// Server-list fetches ride the provider upstream: the injected engine
+	// route, else the raw upstream_proxy URL, else direct.
+	if d := fetchDialer(upstream, opts.upstreamProxyURL); d != nil {
+		config.SetFetchDialer(d)
 	}
 
 	if err := config.Commit(true); err != nil {
@@ -302,11 +348,13 @@ func (enabledComponents) InproxyEnabled() bool              { return false }
 
 // supportedProtocols lists the tunnel protocols a server entry supports in
 // this build. Informational: the provider surfaces it in per-server outbound
-// configs so the web UI can show what each server speaks.
-func supportedProtocols(entry *protocol.ServerEntry, useUpstreamProxy bool) []string {
+// configs so the web UI can show what each server speaks. No upstream-proxy
+// protocol filter applies: tunnel dials ride the protocol-neutral engine
+// stack (or direct), never the provider upstream.
+func supportedProtocols(entry *protocol.ServerEntry) []string {
 	protocols := entry.GetSupportedProtocols(
 		enabledComponents{},
-		useUpstreamProxy,
+		false, // useUpstreamProxy: tunnel dials never ride the provider upstream
 		nil, // limitTunnelProtocols: none configured
 		nil, // limitTunnelDialPortNumbers: none configured
 		nil, // limitQUICVersions: none configured

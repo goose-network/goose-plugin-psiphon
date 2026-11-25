@@ -3,12 +3,15 @@
 //
 // It embeds github.com/goose-network/psiphon-tunnel-core as a Go library and
 // runs its controllers directly — no local SOCKS or HTTP proxy sits between
-// goose and the tunnels. Two seams make that work:
+// goose and the tunnels. Three seams make that work:
 //
 //   - dials go through controller.Dial, in process (outbound.go);
 //   - the tunnels' own TCP connections to their Psiphon servers dial through
 //     the engine's layer-3/4 stack — the system kernel stack or the gvisor
-//     netstack — via Config.SetCustomDialer (tunnel.go).
+//     netstack — via Config.SetCustomDialer (tunnel.go);
+//   - the untunneled server-list/upgrade fetches dial through the provider
+//     upstream (engine route or raw URL) via Config.SetFetchDialer, keeping
+//     that upstream off the tunnels' data path (tunnel.go).
 //
 // # The real server list
 //
@@ -42,19 +45,18 @@
 //	  "config_path":      "/path/to/psiphon.config", // optional; default embedded network config
 //	  "server_list_path": "/path/to/server_list.dat", // optional; imported into the datastore
 //	  "data_dir":         "/path/to/data-root",      // optional; default "psiphon-data"
-//	  "upstream_proxy":   "socks5://127.0.0.1:7890",  // optional; routes tunnel-core's own dials
+//	  "upstream_proxy":   "socks5://127.0.0.1:7890",  // optional; routes the server-list fetches only
 //	  "establish_timeout_seconds": 120,                // optional
 //	  "outbound_id":      "psiphon"                    // optional, default "psiphon"
 //	}
 //
-// upstream_proxy routes tunnel-core's connections (list fetches, and tunnel
-// dials when the engine injected no dialer of its own) through an explicit
-// proxy URL. The engine-injected dialers own tunnel dials first: the route
-// dialer injected when the provider spec's upstream_proxy names an engine
-// route (outbound:/pool:/chain:), else the engine stack — tunnel-core's
-// CustomDialer replaces the base dialer, so UpstreamProxyURL cannot reach
-// tunnel dials once either is set, but it keeps serving the untunneled list
-// fetches no custom dialer reaches.
+// upstream_proxy routes only the plugin's server-list fetches (the untunneled
+// remote server list and upgrade downloads) through an explicit proxy URL —
+// never the outbounds' tunnel dials. The engine-injected route dialer (when
+// the provider spec's upstream_proxy names an engine route:
+// outbound:/pool:/chain:) outranks the raw URL for those fetches. Tunnel dials
+// ride the engine stack dialer, or dial directly when none was injected; the
+// raw URL is kept out of tunnel-core's config so it cannot reach them.
 //
 // # Fresh-deployment default
 //
@@ -95,18 +97,20 @@ type Provider struct {
 
 	// configJSON is the sanitized base config every tunnel loads: defaults
 	// or the operator's config_path, with the runtime-owned fields stripped
-	// and the upstream proxy injected.
+	// and UpstreamProxyURL removed (the raw upstream is fetch-only, carried
+	// by the fetch dialer, never tunnel-core's config).
 	configJSON []byte
 	dataDir    string
 
 	// stackDialer is the engine's L3/L4 dialer injected under
-	// pub.StackDialerKey; nil means tunnel-core dials directly.
+	// pub.StackDialerKey; it carries tunnel dials. nil means tunnel-core
+	// dials directly.
 	stackDialer pub.StackDialer
 
 	// upstream is the engine's upstream-route dialer injected under
 	// pub.UpstreamDialerKey when the provider spec's upstream_proxy names a
-	// goose route (outbound:/pool:/chain:). Non-nil outranks stackDialer:
-	// the tunnels' connections to their Psiphon servers ride the route.
+	// goose route (outbound:/pool:/chain:). It carries the server-list
+	// fetches only — never tunnel dials.
 	upstream pub.UpstreamDialer
 
 	ctx    context.Context
@@ -118,8 +122,8 @@ type Provider struct {
 
 	mu      sync.Mutex
 	closed  bool                     // Close ran; serverTunnelState hands out no new state
-	servers map[string]serverInfo    // last scan, by IP: the pin sources
-	pinned  map[string]*serverTunnel // live per-server controllers, by IP
+	servers map[string]serverInfo    // last scan, by endpoint (ip:port): the pin sources
+	pinned  map[string]*serverTunnel // live per-server controllers, by endpoint
 
 	watchCh chan struct{}
 	unsub   func() // notice hub unsubscribe
@@ -170,7 +174,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		// remote-server-list fetcher can retrieve the server list itself.
 		configJSON = defaultConfigJSON()
 	}
-	configJSON, err = sanitizeConfig(configJSON, pc.UpstreamProxy)
+	configJSON, err = sanitizeConfig(configJSON)
 	if err != nil {
 		return nil, fmt.Errorf("psiphon provider: sanitize config: %w", err)
 	}
@@ -201,6 +205,7 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 		label:             pc.OutboundID,
 		dataRootDirectory: dataDir,
 		establishTimeout:  p.establishTimeout(),
+		upstreamProxyURL:  pc.UpstreamProxy,
 	}, stackDialer, upstream)
 	if err != nil {
 		cancel()
@@ -309,34 +314,39 @@ func (p *Provider) Watch() <-chan struct{} { return p.watchCh }
 // outbound in the engine config (tunnel: "psiphon") still dials through the
 // main tunnel unchanged.
 func (p *Provider) Outbounds(_ context.Context) ([]pub.OutboundConfig, error) {
-	// Tunnel dials ride a connected TCP tunnel when a raw upstream proxy URL
-	// or an injected engine route is configured, so list only the protocols
-	// that can (the engine stack is protocol-neutral and needs no filter).
-	servers, err := scanPinnableServers(p.cfg.UpstreamProxy != "" || p.upstream != nil)
+	// Tunnel dials ride the protocol-neutral engine stack (or direct), never
+	// the provider upstream, so the scan lists every protocol this build
+	// carries — no upstream-proxy filter.
+	servers, err := scanPinnableServers()
 	if err != nil {
 		// Transient datastore trouble: keep the engine's existing pools; the
 		// next refresh signal retries.
 		return nil, err
 	}
 
-	// Publish the scan for the dial path (pin sources) before emitting.
+	// Publish the scan for the dial path (pin sources) before emitting. Keyed
+	// by endpoint (ip:port) so two servers sharing an IP on different ports
+	// both survive.
 	p.mu.Lock()
 	srv := make(map[string]serverInfo, len(servers))
 	for _, s := range servers {
-		srv[s.IP] = s
+		srv[s.key()] = s
 	}
 	p.servers = srv
 	p.mu.Unlock()
 
 	out := make([]pub.OutboundConfig, 0, len(servers))
 	for _, s := range servers {
+		// The ID carries the server's ip:port literally so it names the proxy
+		// server it pins; "server" matches the pin-source map key.
+		id := p.cfg.OutboundID + "-" + s.key()
 		out = append(out, pub.OutboundConfig{
-			ID:       p.cfg.OutboundID + "-" + s.IP,
+			ID:       id,
 			Protocol: "psiphon",
 			Config: map[string]any{
-				"id":        p.cfg.OutboundID + "-" + s.IP,
+				"id":        id,
 				"tunnel":    p.cfg.OutboundID,
-				"server":    s.IP,
+				"server":    s.key(),
 				"address":   s.Address,
 				"region":    s.Region,
 				"protocols": s.Protocols,
@@ -356,12 +366,11 @@ func (p *Provider) Status() pub.ProviderStatus {
 
 	details := map[string]any{
 		"data_dir":       p.dataDir,
-		"upstream_proxy": p.cfg.UpstreamProxy != "", // raw URL: untunneled fetches
-		"engine_route":   p.upstream != nil,         // tunnel dials ride it
-		// The stack carries tunnel dials only when no route outranks it; a
-		// raw upstream_proxy never reaches tunnel dials once a custom
-		// dialer is set (CustomDialer replaces tunnel-core's base dialer).
-		"engine_stack":    p.stackDialer != nil && p.upstream == nil,
+		"upstream_proxy": p.cfg.UpstreamProxy != "", // raw URL: server-list fetches only
+		"engine_route":   p.upstream != nil,         // server-list fetches ride it
+		// The stack carries tunnel dials whenever injected; the provider
+		// upstream (route or raw URL) is fetch-only and never reaches them.
+		"engine_stack":    p.stackDialer != nil,
 		"servers_in_list": len(p.servers),
 	}
 
@@ -388,8 +397,8 @@ func (p *Provider) Status() pub.ProviderStatus {
 	if len(p.pinned) > 0 {
 		pinned := make([]string, 0, len(p.pinned))
 		open := 0
-		for ip, st := range p.pinned {
-			pinned = append(pinned, ip)
+		for addr, st := range p.pinned {
+			pinned = append(pinned, addr)
 			open += int(st.open.Load())
 		}
 		sort.Strings(pinned)
@@ -453,8 +462,8 @@ func (p *Provider) dialMain(ctx context.Context, target string) (net.Conn, error
 // dialServer connects through the pinned controller for one server,
 // starting it lazily on first use. The open-connection pin taken here holds
 // the reaper off until the engine closes the connection.
-func (p *Provider) dialServer(ctx context.Context, ip, target string) (net.Conn, error) {
-	st, err := p.serverTunnelState(ip)
+func (p *Provider) dialServer(ctx context.Context, addr, target string) (net.Conn, error) {
+	st, err := p.serverTunnelState(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -477,25 +486,25 @@ func (p *Provider) dialServer(ctx context.Context, ip, target string) (net.Conn,
 	return &countingConn{Conn: conn, done: func() { st.open.Add(-1) }}, nil
 }
 
-// serverTunnelState returns the pinned-tunnel state for ip, creating it from
-// the last scan when absent. An ip missing from the scan is a stale outbound
-// config (the server left the list) or a hand-written mistake: error, don't
-// dial blind.
-func (p *Provider) serverTunnelState(ip string) (*serverTunnel, error) {
+// serverTunnelState returns the pinned-tunnel state for addr (the server's
+// ip:port endpoint), creating it from the last scan when absent. An addr
+// missing from the scan is a stale outbound config (the server left the list)
+// or a hand-written mistake: error, don't dial blind.
+func (p *Provider) serverTunnelState(addr string) (*serverTunnel, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return nil, fmt.Errorf("psiphon: provider closed")
 	}
-	if st, ok := p.pinned[ip]; ok {
+	if st, ok := p.pinned[addr]; ok {
 		return st, nil
 	}
-	info, ok := p.servers[ip]
+	info, ok := p.servers[addr]
 	if !ok {
-		return nil, fmt.Errorf("psiphon: server %s is not in the current list", ip)
+		return nil, fmt.Errorf("psiphon: server %s is not in the current list", addr)
 	}
-	st := &serverTunnel{ip: ip, encoded: info.Encoded}
-	p.pinned[ip] = st
+	st := &serverTunnel{addr: addr, encoded: info.Encoded}
+	p.pinned[addr] = st
 	return st, nil
 }
 
@@ -511,7 +520,7 @@ func (p *Provider) tunnelForServer(st *serverTunnel) (*tunnelCore, error) {
 		// The owner already dropped st from p.pinned; a controller started
 		// here would be orphaned. The dialer's retry gets fresh state from
 		// serverTunnelState.
-		return nil, fmt.Errorf("psiphon: server %s tunnel state retired; retry", st.ip)
+		return nil, fmt.Errorf("psiphon: server %s tunnel state retired; retry", st.addr)
 	}
 	if st.tunnel != nil && !st.tunnel.stopped() {
 		return st.tunnel, nil
@@ -521,10 +530,11 @@ func (p *Provider) tunnelForServer(st *serverTunnel) (*tunnelCore, error) {
 	}
 	st.touch()
 	t, err := newTunnelCore(p.configJSON, tunnelOptions{
-		label:             fmt.Sprintf("%s[%s]", p.cfg.OutboundID, st.ip),
+		label:             fmt.Sprintf("%s[%s]", p.cfg.OutboundID, st.addr),
 		dataRootDirectory: p.dataDir,
 		targetServerEntry: st.encoded,
 		establishTimeout:  p.establishTimeout(),
+		upstreamProxyURL:  p.cfg.UpstreamProxy,
 	}, p.stackDialer, p.upstream)
 	if err != nil {
 		st.startErr, st.startAt = err, time.Now()
@@ -553,7 +563,7 @@ func (p *Provider) reapLoop(ctx context.Context) {
 func (p *Provider) reapOnce() {
 	p.mu.Lock()
 	var reap []*serverTunnel
-	for ip, st := range p.pinned {
+	for addr, st := range p.pinned {
 		if st.open.Load() != 0 {
 			continue
 		}
@@ -570,11 +580,11 @@ func (p *Provider) reapOnce() {
 			continue
 		}
 		reap = append(reap, st)
-		delete(p.pinned, ip)
+		delete(p.pinned, addr)
 	}
 	p.mu.Unlock()
 	for _, st := range reap {
-		fmt.Printf("psiphon provider: reaping idle tunnel %s[%s]\n", p.cfg.OutboundID, st.ip)
+		fmt.Printf("psiphon provider: reaping idle tunnel %s[%s]\n", p.cfg.OutboundID, st.addr)
 		st.stop()
 	}
 }
@@ -594,9 +604,11 @@ func (p *Provider) signalWatch() {
 // proxy ports, target server entry, notice routing, timeouts, ...) are set
 // by the plugin per controller and must not leak in from the file. It does
 // NOT strip DisableRemoteServerListFetcher from the general config — the
-// background fetcher is what auto-updates the server list. The optional
-// upstream proxy is injected.
-func sanitizeConfig(raw []byte, upstreamProxy string) ([]byte, error) {
+// background fetcher is what auto-updates the server list. UpstreamProxyURL
+// is stripped, not injected: the raw upstream proxy is fetch-only, carried by
+// the fetch dialer (tunnel.go), so it must never reach tunnel-core's tunnel
+// dials.
+func sanitizeConfig(raw []byte) ([]byte, error) {
 	var cfg map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config JSON: %w", err)
@@ -628,10 +640,6 @@ func sanitizeConfig(raw []byte, upstreamProxy string) ([]byte, error) {
 		"UpstreamProxyURL",
 	} {
 		delete(cfg, k)
-	}
-	if upstreamProxy != "" {
-		b, _ := json.Marshal(upstreamProxy)
-		cfg["UpstreamProxyURL"] = b
 	}
 	out, err := json.Marshal(cfg)
 	if err != nil {

@@ -2,11 +2,13 @@ package psiphon
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,40 +59,84 @@ func (f fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address s
 	return c1, nil
 }
 
-// TestEngineCustomDialerPrecedence verifies the dialer choice newTunnelCore
-// hands tunnel-core's CustomDialer: an injected engine route (a goose
-// outbound/pool/chain) outranks the engine stack, the stack outranks
-// tunnel-core's kernel dialer, and the chosen dialer is called with the
-// dial arguments verbatim.
-func TestEngineCustomDialerPrecedence(t *testing.T) {
-	if d := engineCustomDialer(nil, nil); d != nil {
-		t.Fatal("engineCustomDialer(nil, nil) must be nil")
-	}
-
+// TestDialerSelection verifies the fetch/tunnel dialer separation: tunnel
+// dials ride the engine stack (the provider upstream is not even an input, so
+// it can never reach them), while server-list fetches ride the injected engine
+// route, falling back to the raw upstream proxy URL, then direct.
+func TestDialerSelection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stackRec, routeRec := &dialRecorder{}, &dialRecorder{}
-	d := engineCustomDialer(fakeStackDialer{stackRec}, fakeUpstreamDialer{routeRec})
+	// Tunnel dials: the stack carries them; a nil stack means direct (nil
+	// dialer, tunnel-core's own kernel dialer).
+	if d := tunnelCustomDialer(nil); d != nil {
+		t.Fatal("tunnelCustomDialer(nil) must be nil (direct dial)")
+	}
+	stackRec := &dialRecorder{}
+	d := tunnelCustomDialer(fakeStackDialer{stackRec})
 	conn, err := d(ctx, "tcp", "192.0.2.10:443")
 	if err != nil {
-		t.Fatalf("dial through the route: %v", err)
+		t.Fatalf("tunnel dial through the stack: %v", err)
 	}
 	_ = conn.Close()
-	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp 192.0.2.10:443" {
-		t.Fatalf("route dialed %v, want one tcp dial to the server", got)
-	}
-	if got := stackRec.recorded(); len(got) != 0 {
-		t.Fatalf("stack dialed %v, want none — the route outranks the stack", got)
-	}
-
-	stackRec = &dialRecorder{}
-	d = engineCustomDialer(fakeStackDialer{stackRec}, nil)
-	if _, err := d(ctx, "tcp", "192.0.2.10:443"); err != nil {
-		t.Fatalf("dial through the stack: %v", err)
-	}
 	if got := stackRec.recorded(); len(got) != 1 || got[0] != "tcp 192.0.2.10:443" {
 		t.Fatalf("stack dialed %v, want one tcp dial to the server", got)
+	}
+
+	// Fetches: the injected route outranks the raw URL.
+	routeRec := &dialRecorder{}
+	d = fetchDialer(fakeUpstreamDialer{routeRec}, "socks5://127.0.0.1:7890")
+	conn, err = d(ctx, "tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("fetch dial through the route: %v", err)
+	}
+	_ = conn.Close()
+	if got := routeRec.recorded(); len(got) != 1 || got[0] != "tcp example.com:443" {
+		t.Fatalf("route dialed %v, want one tcp fetch dial", got)
+	}
+
+	// No route, no raw URL: fetches dial directly (nil dialer).
+	if d := fetchDialer(nil, ""); d != nil {
+		t.Fatal("fetchDialer(nil, \"\") must be nil (direct fetch)")
+	}
+	// No route but a raw URL: a proxy fetch dialer is produced (exercised
+	// against a live listener in TestRawProxyFetchDialerUsesProxy).
+	if d := fetchDialer(nil, "socks5://127.0.0.1:7890"); d == nil {
+		t.Fatal("fetchDialer(nil, rawURL) must produce a proxy dialer")
+	}
+}
+
+// TestRawProxyFetchDialerUsesProxy verifies the raw-URL fetch dialer connects
+// to the configured upstream proxy (not the target directly): the proxy
+// listener accepts the connection, then refuses the SOCKS handshake, so the
+// dial fails — but only after reaching the proxy.
+func TestRawProxyFetchDialerUsesProxy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	var accepted atomic.Int32
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted.Add(1)
+		_ = conn.Close() // refuse the proxy handshake
+	}()
+
+	d := fetchDialer(nil, "socks5://"+ln.Addr().String())
+	if d == nil {
+		t.Fatal("fetchDialer(nil, rawURL) returned nil")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := d(ctx, "tcp", "example.com:443"); err == nil {
+		t.Fatal("expected the refused proxy handshake to fail the dial")
+	}
+	if accepted.Load() == 0 {
+		t.Fatal("fetch dialer did not connect to the raw upstream proxy")
 	}
 }
 
@@ -111,8 +157,8 @@ func TestStatusDialerDetails(t *testing.T) {
 	// Bare provider: nothing routed.
 	check(map[string]bool{"upstream_proxy": false, "engine_route": false, "engine_stack": false})
 
-	// Raw URL: untunneled list fetches ride it; tunnel dials stay on the
-	// kernel dialer.
+	// Raw URL: server-list fetches ride it; tunnel dials stay on the kernel
+	// dialer (no stack injected yet).
 	p.cfg.UpstreamProxy = "socks5://127.0.0.1:7890"
 	check(map[string]bool{"upstream_proxy": true, "engine_route": false, "engine_stack": false})
 
@@ -120,9 +166,10 @@ func TestStatusDialerDetails(t *testing.T) {
 	p.stackDialer = fakeStackDialer{&dialRecorder{}}
 	check(map[string]bool{"engine_stack": true})
 
-	// Engine route injected: it carries tunnel dials; the stack does not.
+	// Engine route injected: it carries the fetches; the stack still carries
+	// tunnel dials (the route is fetch-only, never a tunnel dialer).
 	p.upstream = fakeUpstreamDialer{&dialRecorder{}}
-	check(map[string]bool{"engine_route": true, "engine_stack": false})
+	check(map[string]bool{"engine_route": true, "engine_stack": true})
 }
 
 // encodeTestEntry builds a syntactically valid encoded server entry for the
@@ -146,7 +193,8 @@ func encodeTestEntry(t *testing.T) string {
 // runtime-owned fields the plugin sets per controller (a leaked
 // TargetServerEntry would pin the general tunnel; leaked notice-file routing
 // would swallow the server-list signal; a leaked data root would split
-// state) and injects the upstream proxy.
+// state) and strips UpstreamProxyURL (the raw upstream is fetch-only, carried
+// by the fetch dialer, never tunnel-core's config).
 func TestSanitizeConfigStripsRuntimeFields(t *testing.T) {
 	raw := `{
 		"PropagationChannelId": "0000000000000000",
@@ -165,7 +213,7 @@ func TestSanitizeConfigStripsRuntimeFields(t *testing.T) {
 		"UseNoticeFiles": {"RotatingFileSize": 1024},
 		"UpstreamProxyUrl": "http://leaky"
 	}`
-	out, err := sanitizeConfig([]byte(raw), "socks5://127.0.0.1:7890")
+	out, err := sanitizeConfig([]byte(raw))
 	if err != nil {
 		t.Fatalf("sanitizeConfig: %v", err)
 	}
@@ -194,8 +242,8 @@ func TestSanitizeConfigStripsRuntimeFields(t *testing.T) {
 	if cfg.EstablishTunnelTimeoutSeconds != nil {
 		t.Fatalf("EstablishTunnelTimeoutSeconds leaked: %d", *cfg.EstablishTunnelTimeoutSeconds)
 	}
-	if cfg.UpstreamProxyURL != "socks5://127.0.0.1:7890" {
-		t.Fatalf("UpstreamProxyURL = %q", cfg.UpstreamProxyURL)
+	if cfg.UpstreamProxyURL != "" {
+		t.Fatalf("UpstreamProxyURL must be stripped (fetch-only, never tunnel dials), got %q", cfg.UpstreamProxyURL)
 	}
 }
 
@@ -287,9 +335,9 @@ func TestOutboundFactory(t *testing.T) {
 	}
 
 	server, err := New(map[string]any{
-		"id":      "psiphon-192.0.2.10",
+		"id":      "psiphon-192.0.2.10:443",
 		"tunnel":  "psiphon",
-		"server":  "192.0.2.10",
+		"server":  "192.0.2.10:443",
 		"address": "192.0.2.10:443",
 		"region":  "TEST",
 	})
@@ -328,14 +376,14 @@ func TestOutboundFactoryNeedsKnownServer(t *testing.T) {
 	p := &Provider{
 		cfg: providerConfig{OutboundID: "psiphon-test-needs-known"},
 		servers: map[string]serverInfo{
-			"192.0.2.10": {IP: "192.0.2.10", Encoded: encodeTestEntry(t)},
+			"192.0.2.10:443": {IP: "192.0.2.10", Address: "192.0.2.10:443", Encoded: encodeTestEntry(t)},
 		},
 		pinned: map[string]*serverTunnel{},
 	}
 	registerLiveProvider(p)
 	defer unregisterLiveProvider(p)
 
-	known, err := New(map[string]any{"id": "k", "tunnel": p.cfg.OutboundID, "server": "192.0.2.10"})
+	known, err := New(map[string]any{"id": "k", "tunnel": p.cfg.OutboundID, "server": "192.0.2.10:443"})
 	if err != nil {
 		t.Fatalf("New(known): %v", err)
 	}
@@ -343,11 +391,11 @@ func TestOutboundFactoryNeedsKnownServer(t *testing.T) {
 	// test); what matters is it gets past the scan-cache check. The error
 	// must not be "not in the current list".
 	_, dialErr := known.DialContext(context.Background(), pub.NetworkTCP, "example.com:80")
-	if dialErr != nil && dialErr.Error() == "psiphon: server 192.0.2.10 is not in the current list" {
+	if dialErr != nil && dialErr.Error() == "psiphon: server 192.0.2.10:443 is not in the current list" {
 		t.Fatalf("known server rejected: %v", dialErr)
 	}
 
-	unknown, err := New(map[string]any{"id": "u", "tunnel": p.cfg.OutboundID, "server": "192.0.2.99"})
+	unknown, err := New(map[string]any{"id": "u", "tunnel": p.cfg.OutboundID, "server": "192.0.2.99:443"})
 	if err != nil {
 		t.Fatalf("New(unknown): %v", err)
 	}
@@ -450,7 +498,7 @@ func TestStatusReport(t *testing.T) {
 	p := &Provider{
 		cfg:     providerConfig{OutboundID: "psiphon", EstablishTimeoutSeconds: 30},
 		dataDir: "/tmp/psiphon-status-test",
-		servers: map[string]serverInfo{"1.2.3.4": {}, "5.6.7.8": {}},
+		servers: map[string]serverInfo{"1.2.3.4:443": {}, "5.6.7.8:443": {}},
 		pinned:  map[string]*serverTunnel{},
 		watchCh: make(chan struct{}, 1),
 	}
@@ -485,12 +533,12 @@ func TestStatusReport(t *testing.T) {
 	}
 
 	// A pinned tunnel with an open connection is summarized.
-	stp := &serverTunnel{ip: "1.2.3.4"}
+	stp := &serverTunnel{addr: "1.2.3.4:443"}
 	stp.open.Add(2)
-	p.pinned["1.2.3.4"] = stp
+	p.pinned["1.2.3.4:443"] = stp
 	st = p.Status()
-	if pins, ok := st.Details["pinned_tunnels"].([]string); !ok || len(pins) != 1 || pins[0] != "1.2.3.4" {
-		t.Errorf("pinned_tunnels = %v, want [1.2.3.4]", st.Details["pinned_tunnels"])
+	if pins, ok := st.Details["pinned_tunnels"].([]string); !ok || len(pins) != 1 || pins[0] != "1.2.3.4:443" {
+		t.Errorf("pinned_tunnels = %v, want [1.2.3.4:443]", st.Details["pinned_tunnels"])
 	}
 	if st.Details["open_connections"] != 2 {
 		t.Errorf("open_connections = %v, want 2", st.Details["open_connections"])
@@ -546,6 +594,100 @@ func TestOutboundsOmitsGenericTunnel(t *testing.T) {
 	}
 }
 
+// TestServerInfoKey verifies the endpoint identity used for outbound IDs and
+// the pin-source map: ip:port when the entry has a web server port, falling
+// back to the bare IP otherwise.
+func TestServerInfoKey(t *testing.T) {
+	if k := (serverInfo{IP: "1.2.3.4", Address: "1.2.3.4:443"}).key(); k != "1.2.3.4:443" {
+		t.Errorf("key = %q, want 1.2.3.4:443", k)
+	}
+	if k := (serverInfo{IP: "1.2.3.4"}).key(); k != "1.2.3.4" {
+		t.Errorf("fallback key = %q, want 1.2.3.4", k)
+	}
+}
+
+// TestOutboundsIDsCarryAddress verifies every per-server outbound ID carries
+// the server's ip:port literally, the "id" config key equals the ID, and
+// "server" matches the pin-source map key the dial path looks up. Distinct
+// endpoints get distinct IDs.
+func TestOutboundsIDsCarryAddress(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := psiphon.OpenDataStore(&psiphon.Config{DataRootDirectory: root}); err != nil {
+		t.Fatalf("OpenDataStore: %v", err)
+	}
+	defer psiphon.CloseDataStore()
+
+	store := func(ip, port, secret string) {
+		t.Helper()
+		data, err := json.Marshal(&protocol.ServerEntry{
+			IpAddress:       ip,
+			WebServerPort:   port,
+			WebServerSecret: secret,
+			Region:          "TEST",
+			Capabilities:    []string{protocol.CAPABILITY_SSH_API_REQUESTS},
+		})
+		if err != nil {
+			t.Fatalf("marshal entry: %v", err)
+		}
+		var fields protocol.ServerEntryFields
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("unmarshal fields: %v", err)
+		}
+		fields.SetLocalSource(protocol.SERVER_ENTRY_SOURCE_EMBEDDED)
+		fields.SetLocalTimestamp(time.Now().UTC().Format(time.RFC3339))
+		if err := psiphon.StoreServerEntry(fields, true); err != nil {
+			t.Fatalf("StoreServerEntry: %v", err)
+		}
+	}
+	store("192.0.2.10", "443", "secret-a")
+	store("192.0.2.20", "8443", "secret-b")
+
+	p := &Provider{
+		cfg:     providerConfig{OutboundID: "psiphon"},
+		dataDir: root,
+		servers: map[string]serverInfo{},
+		pinned:  map[string]*serverTunnel{},
+		watchCh: make(chan struct{}, 1),
+		main:    &tunnelCore{},
+	}
+	out, err := p.Outbounds(context.Background())
+	if err != nil {
+		t.Fatalf("Outbounds: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("outbounds = %d, want 2 (%v)", len(out), out)
+	}
+	byID := map[string]pub.OutboundConfig{}
+	for _, o := range out {
+		byID[o.ID] = o
+	}
+	for _, addr := range []string{"192.0.2.10:443", "192.0.2.20:8443"} {
+		id := "psiphon-" + addr
+		o, ok := byID[id]
+		if !ok {
+			t.Fatalf("missing outbound ID %q (got %v)", id, byID)
+		}
+		if o.Config["id"] != id {
+			t.Errorf("config id = %v, want %q", o.Config["id"], id)
+		}
+		if o.Config["server"] != addr {
+			t.Errorf("config server = %v, want %q", o.Config["server"], addr)
+		}
+		if o.Config["address"] != addr {
+			t.Errorf("config address = %v, want %q", o.Config["address"], addr)
+		}
+		// The pin-source map is keyed by the same endpoint the ID carries, so
+		// the dial path (serverTunnelState) finds it.
+		if _, ok := p.servers[addr]; !ok {
+			t.Errorf("pin-source map missing key %q", addr)
+		}
+	}
+}
+
 // TestServerTunnelStateRefusesAfterClose pins the Close ordering: a dial that
 // already passed lookupLiveProvider must not be handed pinned state, because
 // Close has drained p.pinned and nothing would ever stop what it starts. The
@@ -554,10 +696,10 @@ func TestOutboundsOmitsGenericTunnel(t *testing.T) {
 func TestServerTunnelStateRefusesAfterClose(t *testing.T) {
 	p := &Provider{
 		closed:  true,
-		servers: map[string]serverInfo{"1.2.3.4": {IP: "1.2.3.4"}},
+		servers: map[string]serverInfo{"1.2.3.4:443": {IP: "1.2.3.4", Address: "1.2.3.4:443"}},
 		pinned:  map[string]*serverTunnel{},
 	}
-	if _, err := p.serverTunnelState("1.2.3.4"); err == nil {
+	if _, err := p.serverTunnelState("1.2.3.4:443"); err == nil {
 		t.Error("serverTunnelState handed out state on a closed provider")
 	}
 }
@@ -568,7 +710,7 @@ func TestServerTunnelStateRefusesAfterClose(t *testing.T) {
 // dialer's retry gets fresh state from serverTunnelState instead.
 func TestTunnelForServerRefusesDeadState(t *testing.T) {
 	p := &Provider{cfg: providerConfig{OutboundID: "psiphon"}}
-	st := &serverTunnel{ip: "1.2.3.4"}
+	st := &serverTunnel{addr: "1.2.3.4:443"}
 	st.stop()
 	_, err := p.tunnelForServer(st)
 	if err == nil || !strings.Contains(err.Error(), "retired") {

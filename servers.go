@@ -35,21 +35,34 @@ type serverInfo struct {
 	Protocols []string
 }
 
+// key is the server's stable identity for outbound IDs and the pin-source
+// map: its ip:port endpoint, falling back to the bare IP for an entry with no
+// web server port. Two servers sharing an IP on different ports get distinct
+// keys (and IDs); duplicate entries for one endpoint collapse to one.
+func (s serverInfo) key() string {
+	if s.Address != "" {
+		return s.Address
+	}
+	return s.IP
+}
+
 // serverStartRetryInterval bounds how long a failed pinned-controller start
 // is cached before a later dial retries it.
 const serverStartRetryInterval = 30 * time.Second
 
 // scanPinnableServers reads the datastore's current server entries and
 // returns the ones a pinned controller can use: those supporting SSH API
-// requests, which is what Config.TargetServerEntry requires.
+// requests, which is what Config.TargetServerEntry requires. Entries are
+// deduplicated by endpoint (serverInfo.key), so two servers sharing an IP on
+// different ports both survive while duplicate entries for one endpoint
+// collapse to a single outbound.
 //
-// useUpstreamProxy filters the protocol listing to the direct-TCP protocols
-// that can ride a proxy — true when tunnel dials go through a raw proxy URL
-// OR an injected engine route (a goose outbound/pool/chain is a connected
-// TCP tunnel, the same constraint); the engine stack needs no filtering (it
-// is protocol-neutral layer 3/4).
-func scanPinnableServers(useUpstreamProxy bool) ([]serverInfo, error) {
+// The protocol listing is not filtered by upstream proxy: tunnel dials ride
+// the protocol-neutral engine stack (or direct), never the provider upstream,
+// so every protocol this build carries is listable.
+func scanPinnableServers() ([]serverInfo, error) {
 	var servers []serverInfo
+	seen := make(map[string]bool)
 	err := psiphon.ScanServerEntries(func(entry *protocol.ServerEntry) bool {
 		if entry.IpAddress == "" || !entry.SupportsSSHAPIRequests() {
 			return true
@@ -63,11 +76,15 @@ func scanPinnableServers(useUpstreamProxy bool) ([]serverInfo, error) {
 			IP:        entry.IpAddress,
 			Region:    entry.Region,
 			Encoded:   encoded,
-			Protocols: supportedProtocols(entry, useUpstreamProxy),
+			Protocols: supportedProtocols(entry),
 		}
 		if entry.WebServerPort != "" {
 			info.Address = net.JoinHostPort(entry.IpAddress, entry.WebServerPort)
 		}
+		if seen[info.key()] {
+			return true
+		}
+		seen[info.key()] = true
 		servers = append(servers, info)
 		return true
 	})
@@ -81,7 +98,7 @@ func scanPinnableServers(useUpstreamProxy bool) ([]serverInfo, error) {
 // the state the reaper and dial path need: the tunnel itself, a cached
 // start failure, and how many engine connections are riding it.
 type serverTunnel struct {
-	ip      string
+	addr    string // server endpoint (ip:port) — the pin-source map key
 	encoded string
 
 	mu       sync.Mutex

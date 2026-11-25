@@ -60,7 +60,7 @@ type Outbound struct {
 	id      string
 	address string // server ip:webPort, or "" for the general shape
 	tunnel  string // owning provider's tunnel ID (registry key)
-	server  string // pinned server IP; "" dials through the general tunnel
+	server  string // pinned server endpoint (ip:port); "" dials through the general tunnel
 	region  string // informational
 }
 
@@ -69,7 +69,7 @@ type Outbound struct {
 //
 //	{"id":"psiphon", "tunnel":"psiphon"}
 //	  → any server, via the provider's general tunnel
-//	{"id":"psiphon-1.2.3.4", "tunnel":"psiphon", "server":"1.2.3.4"}
+//	{"id":"psiphon-1.2.3.4:443", "tunnel":"psiphon", "server":"1.2.3.4:443"}
 //	  → pinned to one server from the provider's list
 //
 // The engine's "_dialer" stack injection is intentionally ignored here: the

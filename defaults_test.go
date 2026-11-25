@@ -59,7 +59,7 @@ func TestParseConfigNoPath(t *testing.T) {
 // same sanitize step startTunnel applies, verifying none of the fields the
 // fetcher needs are stripped.
 func TestSanitizeConfigKeepsDefaults(t *testing.T) {
-	out, err := sanitizeConfig(defaultConfigJSON(), "")
+	out, err := sanitizeConfig(defaultConfigJSON())
 	if err != nil {
 		t.Fatalf("sanitizeConfig(default): %v", err)
 	}
